@@ -20,7 +20,7 @@ controlled environment and run the commands. The idea is to be able
 to reproduce a job run, and hash the job spec. Example:
 
 .. code-block:: python
-    
+
     {
         "import" : [
             {"ref": "BASH", "id": "virtual:bash"},
@@ -29,9 +29,6 @@ to reproduce a job run, and hash the job spec. Example:
             {"ref": "UNIX", "id": "virtual:unix"},
             {"ref": "GCC", "id": "gcc/jonykztnjeqm7bxurpjuttsprphbooqt"}
          ],
-         "nohash_params" : {
-            "NCORES": "4"
-         }
          "commands" : [
              {"chdir": "src"},
              {"prepend_path": "FOOPATH", "value": "$ARTIFACT/bin"},
@@ -50,7 +47,7 @@ to reproduce a job run, and hash the job spec. Example:
     }
 
 
-      
+
 Job spec root node
 ------------------
 
@@ -70,29 +67,16 @@ extra allowed keys:
       imports below.
 
     * **ref**: A name to use to inject information of this dependency
-      into the environment. Above, ``$zlib`` will be the
-      absolute path to the ``zlib`` artifact, and ``$zlib_id`` will be
+      into the environment. Above, ``$ZLIB_DIR`` will be the
+      absolute path to the ``zlib`` artifact, and ``$ZLIB_ID`` will be
       the full artifact ID. This can be set to `None` in order to not
       set any environment variables for the artifact.
-
-    * **in_env**: Whether to run the "on_import" section of the artifact
-      (typically to set up ``$PATH``
-      etc.). Otherwise the artifact can only be used through the
-      variables ``ref`` sets up. Defaults to `True`.
-
-**nohash_params**:
-    Initial set of environment variables that do not contribute to the
-    hash. Should only be used when one is willing to trust that the
-    value does not affect the build result in any way. E.g.,
-    parallelization flags, paths to manually downloaded binary
-    installers, etc.
 
 When executing, the environment is set up as follows:
 
     * Environment is cleared (``os.environ`` has no effect)
     * The initial environment provided by caller (e.g.,
       :class:`.BuildStore` provides `$ARTIFACT` and `$BUILD`) is loaded
-    * The `nohash_params` dict (if present) is loaded into the env
     * The `import` section is processed
     * Commands executed (which may modify env)
 
@@ -116,7 +100,7 @@ See example above for basic script structure. Rules:
    execute sub-commands, and pop the stack.
 
  * `cmd`: The list is passed straight to :func:`subprocess.Popen` as is
-   (after variable substiution). I.e., no quoting, no globbing.
+   (after variable substitution). I.e., no quoting, no globbing.
 
  * `hit`: executes the `hit` tool *in-process*. It acts like `cmd` otherwise,
    e.g., `to_var` works.
@@ -129,11 +113,13 @@ See example above for basic script structure. Rules:
    variable substitution as explained below. `set` simply overwrites
    variable, while the others modify path/flag-style variables, using the
    `os.path.patsep` for `prepend/append_path` and a space for `prepend/append_flag`.
+   **NOTE:** One can use `nohash_value` instead of `value` to avoid the
+   value to enter the hash of a build specification.
 
  * `files` specifies files that are dumped to temporary files and made available
    as `$in0`, `$in1` and so on. Each file has the form ``{typestr: value}``,
    where `typestr` means:
-   
+
        * ``text``: `value` should be a list of strings which are joined by newlines
        * ``string``: `value` is dumped verbatim to file
        * ``json``: `value` is any JSON document, which is serialized to the file
@@ -176,7 +162,7 @@ with the job runner:
 Virtual imports
 ---------------
 
-Some times one do not wish some imports to become part of the hash.
+Some times it is not desirable for some imports to become part of the hash.
 For instance, if the ``cp`` tool is used in the job, one is normally
 ready to trust that the result wouldn't have been different if a newer
 version of the ``cp`` tool was used instead.
@@ -215,7 +201,8 @@ from StringIO import StringIO
 import json
 from pprint import pprint
 
-from ..hdist_logging import CRITICAL, ERROR, WARNING, INFO, DEBUG
+from logging import CRITICAL, ERROR, WARNING, INFO, DEBUG
+from hashdist.util.logger_setup import suppress_log_info, sublevel_added
 
 from .common import working_directory
 
@@ -239,15 +226,8 @@ def substitute(logger, x, env):
         raise ValueError(msg)
 
 def handle_imports(logger, build_store, artifact_dir, virtuals, job_spec):
-    """Assembles a job script by inlining "on_import" sections from imported artifacts
-
-    For each entry in the import section, look up the "on_import" section
-    in the corresponding ``artifact.json`` and inline it in the job spec
-    together with a statement setting ARTIFACT so that it always points
-    to the artifact currently running its code.
-    
-    For the moment, imports are *not* done recursively, i.e., an "import"
-    key is disallowed in the "on_import" section.
+    """Sets up environment variables for a job. This includes $MYIMPORT_DIR, $MYIMPORT_ID,
+    $ARTIFACT, $HDIST_IMPORT, $HDIST_IMPORT_PATHS.
 
     Returns
     -------
@@ -255,7 +235,7 @@ def handle_imports(logger, build_store, artifact_dir, virtuals, job_spec):
     env : dict
         Environment containing HDIST_IMPORT{,_PATHS} and variables for each import.
     script : list
-        Instructions to execte; imports first and the job_spec commands afterwards.
+        Instructions to execute; imports first and the job_spec commands afterwards.
     """
     job_spec = canonicalize_job_spec(job_spec)
 
@@ -264,7 +244,7 @@ def handle_imports(logger, build_store, artifact_dir, virtuals, job_spec):
     env = {}
     HDIST_IMPORT = []
     HDIST_IMPORT_PATHS = []
-    
+
     for import_ in imports:
         dep_id = import_['id']
         dep_ref = import_['ref'] if 'ref' in import_ else None
@@ -285,19 +265,9 @@ def handle_imports(logger, build_store, artifact_dir, virtuals, job_spec):
         HDIST_IMPORT.append(dep_id)
         HDIST_IMPORT_PATHS.append(dep_dir)
         if dep_ref is not None:
-            env[dep_ref] = dep_dir
+            env['%s_DIR' % dep_ref] = dep_dir
             env['%s_ID' % dep_ref] = dep_id
 
-        if import_.get('in_env', True):
-            artifact_json = pjoin(dep_dir, 'artifact.json')
-            with open(artifact_json) as f:
-                import_doc = json.load(f)
-            if 'on_import' not in import_doc:
-                continue
-            on_import = import_doc['on_import']
-            if len(on_import) > 0:
-                result.append({'set': 'ARTIFACT', 'value': dep_dir})
-                result.extend(on_import)
     result.append({'set': 'ARTIFACT', 'value': artifact_dir})
     result.extend(job_spec['commands'])
     env['HDIST_IMPORT'] = ' '.join(HDIST_IMPORT)
@@ -305,7 +275,7 @@ def handle_imports(logger, build_store, artifact_dir, virtuals, job_spec):
     return env, result
 
 def run_job(logger, build_store, job_spec, override_env, artifact_dir, virtuals, cwd, config,
-            temp_dir=None):
+            temp_dir=None, debug=False):
     """Runs a job in a controlled environment, according to rules documented above.
 
     Parameters
@@ -343,6 +313,9 @@ def run_job(logger, build_store, job_spec, override_env, artifact_dir, virtuals,
         A temporary directory for use by the job runner. Files will be left in the
         dir after execution.
 
+    debug : bool
+        Whether to run in debug mode.
+
     Returns
     -------
 
@@ -350,22 +323,21 @@ def run_job(logger, build_store, job_spec, override_env, artifact_dir, virtuals,
         The environment after the last command that was run (regardless
         of scoping/nesting). If the job spec is empty (no commands),
         this will be an empty dict.
-        
+
     """
     env, assembled_commands = handle_imports(logger, build_store, artifact_dir, virtuals, job_spec)
 
     if 'commands' not in job_spec:
         # Wait until here with exiting because we still want to err if imports are not built
         return {}
-    
+
     # Need to explicitly clear PATH, otherwise Popen will set it.
     env['PATH'] = ''
-    env.update(job_spec.get('nohash_params', {}))
     env.update(override_env)
     env['HDIST_VIRTUALS'] = pack_virtuals_envvar(virtuals)
     env['HDIST_CONFIG'] = json.dumps(config, separators=(',', ':'))
     env['PWD'] = os.path.abspath(cwd)
-    executor = CommandTreeExecution(logger, temp_dir)
+    executor = CommandTreeExecution(logger, temp_dir, debug=debug)
     try:
         executor.run_command_list(assembled_commands, env, ())
     finally:
@@ -379,7 +351,6 @@ def canonicalize_job_spec(job_spec):
     """
     def canonicalize_import(item):
         item = dict(item)
-        item.setdefault('in_env', True)
         if item.setdefault('ref', None) == '':
             raise ValueError('Empty ref should be None, not ""')
         return item
@@ -387,9 +358,8 @@ def canonicalize_job_spec(job_spec):
     result = dict(job_spec)
     result['import'] = [
         canonicalize_import(item) for item in result.get('import', ())]
-    result.setdefault("nohash_params", {})
     return result
-    
+
 def substitute(x, env):
     """
     Substitute environment variable into a string following the rules
@@ -422,7 +392,7 @@ class CommandTreeExecution(object):
 
     Executing :meth:`run` multiple times amounts to executing
     different variable scopes (but with same logging pipes set up).
-    
+
     Parameters
     ----------
 
@@ -432,13 +402,15 @@ class CommandTreeExecution(object):
         A temporary directory on a local filesystem. Currently used for creating
         pipes with the "hit logpipe" command.
     """
-    
-    def __init__(self, logger, temp_dir=None):
+
+    def __init__(self, logger, temp_dir=None, debug=False, debug_shell='/bin/bash'):
+        self.debug = debug
+        self.debug_shell = debug_shell # todo: pass this in from outside
         self.logger = logger
         self.log_fifo_filenames = {}
         if temp_dir is None:
             self.rm_temp_dir = True
-            temp_dir = tempfile.mkdtemp(prefix='hashdist-run-job-')
+            temp_dir = os.path.realpath(tempfile.mkdtemp(prefix='hashdist-run-job-'))
         else:
             if os.listdir(temp_dir) != []:
                 raise Exception('temp_dir must be an empty directory')
@@ -546,13 +518,16 @@ class CommandTreeExecution(object):
     def handle_append_flag(self, node, env, node_pos):
         self.handle_env_mod(node, env, node_pos,
                             node['append_flag'], 'append', ' ')
-    
+
     def handle_prepend_flag(self, node, env, node_pos):
         self.handle_env_mod(node, env, node_pos,
                             node['prepend_flag'], 'prepend', ' ')
 
     def handle_env_mod(self, node, env, node_pos, varname, action, sep):
-        value = self.substitute(node['value'], env)
+        value = node.get('nohash_value', None)
+        if value is None:
+            value = node['value']
+        value = self.substitute(value, env)
         if action == 'set' or varname not in env or len(env[varname]) == 0:
             env[varname] = value
         elif action == 'prepend':
@@ -589,10 +564,12 @@ class CommandTreeExecution(object):
                 key = 'cmd'
                 args = node['cmd']
                 func = self.run_cmd
+                debug_func = self.debug_call
             else:
                 key = 'hit'
                 args = node['hit']
                 func = self.run_hit
+                debug_func = func
             if not isinstance(args, list):
                 raise TypeError("'%s' arguments must be a list, got %r" % (key, args))
             args = [self.substitute(x, node_env) for x in args]
@@ -616,12 +593,18 @@ class CommandTreeExecution(object):
                     func(args, node_env, stdout_to=stdout)
 
             else:
-                func(args, node_env)
+                # does not capture output, so we may decide to debug instead;
+                # debug is not possible when capturing output (until that mechanism
+                # is changed...)
+                if self.debug:
+                    debug_func(args, node_env)
+                else:
+                    func(args, node_env)
         else:
             assert False
 
         self.last_env = dict(node_env)
-        
+
     def handle_commands(self, node, env, node_pos):
         sub_env = dict(env)
         self.run_command_list(node['commands'], sub_env, node_pos)
@@ -633,10 +616,10 @@ class CommandTreeExecution(object):
 
     def run_cmd(self, args, env, stdout_to=None):
         logger = self.logger
-        logger.debug('running %r' % args)
-        logger.debug('environment:')
+        logger.info('running %r' % args)
+        logger.info('environment:')
         for line in pformat(env).splitlines():
-            logger.debug('  ' + line)
+            logger.info('  ' + line)
         try:
             self.logged_check_call(args, env, stdout_to)
         except subprocess.CalledProcessError, e:
@@ -644,35 +627,65 @@ class CommandTreeExecution(object):
             raise
 
     def run_hit(self, args, env, stdout_to=None):
+        """
+        Run ``hit`` in the same process.
+
+        But do not emit INFO-messages from sub-command unless level is
+        DEBUG.
+        """
         args = ['hit'] + args
         logger = self.logger
-        logger.debug('running %r' % args)
-        # run it in the same process, but do not emit
-        # INFO-messages from sub-command unless level is DEBUG
-        old_level = logger.level
+        logger.info('running %r' % args)
         old_stdout = sys.stdout
-        try:
-            if logger.level > DEBUG:
-                logger.level = WARNING
-            if stdout_to is not None:
-                sys.stdout = stdout_to
+        with suppress_log_info('package'):
+            try:
+                if stdout_to is not None:
+                    sys.stdout = stdout_to
+                if len(args) >= 2 and args[1] == 'logpipe':
+                    # raise SystemExit(99)   # Unused??
+                    if len(args) != 4:
+                        raise ValueError('wrong number of arguments to "hit logpipe"')
+                    sublogger_name, level = args[2:]
+                    self.create_log_pipe(sublogger_name, level)
+                else:
+                    from ..cli.main import command_line_entry_point
+                    with working_directory(env['PWD']):
+                        retcode = command_line_entry_point(args, env, secondary=True)
+                    if retcode != 0:
+                        raise RuntimeError("hit command failed with code: %d" % ret)
+            except SystemExit as e:
+                logger.error("hit command failed with code: %d" % e.code)
+                raise
+            except Exception as e:
+                logger.error("hit command failed: %s" % str(e))
+                raise
+            finally:
+                sys.stdout = old_stdout
 
-            if len(args) >= 2 and args[1] == 'logpipe':
-                if len(args) != 4:
-                    raise ValueError('wrong number of arguments to "hit logpipe"')
-                sublogger_name, level = args[2:]
-                self.create_log_pipe(sublogger_name, level)
-            else:
-                from ..cli import main as cli_main
-                with working_directory(env['PWD']):
-                    cli_main(args, env, logger)
-        except:
-            logger.error("hit command failed")
-            raise
+    def debug_call(self, args, env):
+        env = dict(env)
+        # leak PS1 from os environment, but prepend our message
+        env['PS1'] = '[HASHDIST DEBUG] %s' % os.environ.get('PS1', '')
+        # Create temporary file for env used by bash
+        tmpdir = tempfile.mkdtemp()
+        try:
+            rcfile = pjoin(tmpdir, 'env')
+            with open(rcfile, 'w') as f:
+                for key, value in env.iteritems():
+                    f.write("export %s='%s'\n" % (key, value))
+
+            with working_directory(env['PWD']):
+                sys.stderr.write('Entering HashDist debug mode. Please execute the following command: \n')
+                sys.stderr.write('  %s\n' % args)
+                sys.stderr.write('\n')
+                sys.stderr.write('When you are done, "exit 1" to abort build, or "exit 0" to continue.\n\n')
+                proc = subprocess.Popen([self.debug_shell, '--noprofile', '--rcfile', rcfile])
+                retcode = proc.wait()
+                if retcode != 0:
+                    self.logger.error("Debug build manually aborted")
+                    raise RuntimeError("Debug build manually aborted")
         finally:
-            logger.level = old_level
-            sys.stdout = old_stdout
-       
+            shutil.rmtree(tmpdir)
 
     def logged_check_call(self, args, env, stdout_to):
         """
@@ -717,6 +730,7 @@ class CommandTreeExecution(object):
         logger = self.logger
         stdout_fd, stderr_fd = proc.stdout.fileno(), proc.stderr.fileno()
         fds = [stdout_fd, stderr_fd]
+        encoding = sys.stderr.encoding
         for fd in fds: # set O_NONBLOCK
             fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
@@ -749,13 +763,15 @@ class CommandTreeExecution(object):
                         for line in lines:
                             if line[-1] == '\n':
                                 line = line[:-1]
-                            logger.debug(line)
-                    
+                            if encoding:
+                                logger.info(line.decode(encoding))
+                            else:
+                                logger.info(line)
             if proc.poll() is not None:
                 break
         for buf in buffers.values():
             if buf != '':
-                logger.debug(buf)
+                logger.info(buf)
         return proc.wait()
 
     def _log_process_with_logpipes(self, proc, stdout_to):
@@ -764,14 +780,14 @@ class CommandTreeExecution(object):
         # interlaced with use of log pipe etc. we avoid readline(), but
         # instead use os.open to read and handle line-assembly ourselves...
         logger = self.logger
-        
+
         stdout_fd, stderr_fd = proc.stdout.fileno(), proc.stderr.fileno()
         poller = select.poll()
         poller.register(stdout_fd)
         poller.register(stderr_fd)
 
         # Set up { fd : (logger, level) }
-        loggers = {stdout_fd: (logger, DEBUG), stderr_fd: (logger, DEBUG)}
+        loggers = {stdout_fd: (None, INFO), stderr_fd: (None, INFO)}
         buffers = {stdout_fd: '', stderr_fd: ''}
 
         # The FIFO pipes are a bit tricky as they need to the re-opened whenever
@@ -779,14 +795,14 @@ class CommandTreeExecution(object):
         # dict.
 
         fd_to_logpipe = {} # stderr/stdout not re-opened
-        
-        def open_fifo(fifo_filename, logger, level):
+
+        def open_fifo(fifo_filename, header, level):
             # need to open in non-blocking mode to avoid waiting for printing client process
             fd = os.open(fifo_filename, os.O_NONBLOCK|os.O_RDONLY)
             # remove non-blocking after open to treat all streams uniformly in
             # the reading code
             fcntl.fcntl(fd, fcntl.F_SETFL, os.O_RDONLY)
-            loggers[fd] = (logger, level)
+            loggers[fd] = (header, level)
             buffers[fd] = ''
             fd_to_logpipe[fd] = fifo_filename
             poller.register(fd)
@@ -795,8 +811,9 @@ class CommandTreeExecution(object):
             buf = buffers[fd]
             if buf:
                 # flush buffer in case last line not terminated by '\n'
-                sublogger, level = loggers[fd]
-                sublogger.log(level, buf)
+                header, level = loggers[fd]
+                with sublevel_added(logger, header):
+                    logger.log(level, buf)
             del buffers[fd]
 
         def close_fifo(fd):
@@ -805,17 +822,16 @@ class CommandTreeExecution(object):
             os.close(fd)
             del loggers[fd]
             del fd_to_logpipe[fd]
-            
+
         def reopen_fifo(fd):
             fifo_filename = fd_to_logpipe[fd]
-            logger, level = loggers[fd]
+            header, level = loggers[fd]
             close_fifo(fd)
-            open_fifo(fifo_filename, logger, level)
+            open_fifo(fifo_filename, header, level)
 
         for (header, level), fifo_filename in self.log_fifo_filenames.items():
-            sublogger = logger.get_sub_logger(header)
-            open_fifo(fifo_filename, sublogger, level)
-            
+            open_fifo(fifo_filename, header, level)
+
         while True:
             # Python poll() doesn't return when SIGCHLD is received;
             # and there's the freak case where a process first
@@ -854,11 +870,11 @@ class CommandTreeExecution(object):
                         else:
                             buffers[fd] = ''
                         # have list of lines, emit them to logger
-                        sublogger, level = loggers[fd]
+                        header, level = loggers[fd]
                         for line in lines:
-                            if line[-1] == '\n':
-                                line = line[:-1]
-                            sublogger.log(level, line)
+                            line = line.rstrip('\n')
+                            with sublevel_added(logger, header):
+                                logger.log(level, line)
 
         flush_buffer(stderr_fd)
         flush_buffer(stdout_fd)

@@ -10,9 +10,9 @@ matrix:
     - python: 3.3
 before_install:
   - git config --global user.email "hashdist@h.com";
-    git config --global user.name "Hashdist"
+    git config --global user.name "HashDist"
 script:
-  - nosetests -v -s
+  - VERBOSE=1 nosetests -v -s
 branches:
   only:
     - master

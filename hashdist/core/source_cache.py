@@ -97,10 +97,14 @@ import struct
 import errno
 import stat
 from timeit import default_timer as clock
+import contextlib
+import urlparse
 from contextlib import closing
 
-from .hasher import Hasher, format_digest, HashingReadStream, HashingWriteStream
+from .common import working_directory
+from .hasher import hash_document, format_digest, HashingReadStream, HashingWriteStream
 from .fileutils import silent_makedirs
+from .decorators import retry
 
 pjoin = os.path.join
 
@@ -109,6 +113,9 @@ TAG_RE = re.compile(TAG_RE_S)
 
 PACKS_DIRNAME = 'packs'
 GIT_DIRNAME = 'git'
+
+class RemoteFetchError(Exception):
+    pass
 
 class SourceCacheError(Exception):
     pass
@@ -164,13 +171,20 @@ class ProgressBar(object):
     def finish(self):
         sys.stdout.write("\n")
 
-def single_file_key(filename, contents):
-    h = Hasher()
-    h.update('file')
-    h.update({'filename': filename,
-              'contents': contents})
-    return 'file:' + h.format_digest()
+class ProgressSpinner(object):
+    """Replacement for ProgressBar when we don't know the file length."""
+    ANIMATE = ['-', '/', '|', '\\']
 
+    def __init__(self):
+        self._i = 0
+
+    def update(self, current_size):
+        sys.stdout.write('\r{}'.format(self.ANIMATE[self._i]))
+        sys.stdout.flush()
+        self._i = (self._i + 1) % len(self.ANIMATE)
+
+    def finish(self):
+        sys.stdout.write("\n")
 
 def mkdir_if_not_exists(path):
     try:
@@ -183,7 +197,7 @@ class SourceCache(object):
     """
     """
 
-    def __init__(self, cache_path, logger, create_dirs=False):
+    def __init__(self, cache_path, logger, mirrors=(), create_dirs=False):
         if not os.path.isdir(cache_path):
             if create_dirs:
                 silent_makedirs(cache_path)
@@ -191,7 +205,7 @@ class SourceCache(object):
                 raise ValueError('"%s" is not an existing directory' % cache_path)
         self.cache_path = os.path.realpath(cache_path)
         self.logger = logger
-
+        self.mirrors = mirrors
 
     def _ensure_subdir(self, name):
         path = pjoin(self.cache_path, name)
@@ -206,7 +220,16 @@ class SourceCache(object):
     def create_from_config(config, logger, create_dirs=False):
         """Creates a SourceCache from the settings in the configuration
         """
-        return SourceCache(config['sourcecache/sources'], logger, create_dirs)
+        if 'dir' not in config['source_caches'][0]:
+            logger.error('First source cache need to be a local directory')
+            raise NotImplementedError()
+        mirrors = []
+        for entry in config['source_caches'][1:]:
+            if 'url' not in entry:
+                logger.error('All but first source cache currently needs to be remote')
+                raise NotImplementedError()
+            mirrors.append(entry['url'])
+        return SourceCache(config['source_caches'][0]['dir'], logger, mirrors, create_dirs)
 
     def fetch_git(self, repository, rev, repo_name):
         """Fetches source code from git repository
@@ -238,7 +261,7 @@ class SourceCache(object):
         key : str
             The globally unique key; this is the git commit SHA-1 hash
             prepended by ``git:``.
-        
+
         """
         return GitSourceCache(self).fetch_git(repository, rev, repo_name)
 
@@ -257,7 +280,7 @@ class SourceCache(object):
         type : str (optional)
             Type of archive, such as ``"tar.gz"``, ``"tar.gz2"``. For use
             when this cannot be determined from the suffix of the url.
-        
+
         """
         return ArchiveSourceCache(self).fetch_archive(url, type, None)
 
@@ -290,6 +313,7 @@ class SourceCache(object):
             raise ValueError('does not recognize key prefix: %s' % type)
         return handler
 
+    @retry(max_tries=3, exceptions=(RemoteFetchError))
     def fetch(self, url, key, repo_name=None):
         """Fetch sources whose key is known.
 
@@ -360,38 +384,66 @@ class GitSourceCache(object):
         self.repo_path = pjoin(source_cache.cache_path, GIT_DIRNAME)
         self.logger = source_cache.logger
 
-    def git_interactive(self, repo_name, *args):
+    def git(self, repo_name, *args):
         # Inherit stdin/stdout in order to interact with user about any passwords
         # required to connect to any servers and so on
         if args[0] == 'init':
             env = os.environ
         else:
             env = self.get_repo_env(repo_name)
-        subprocess.check_call(['git'] + list(args), env=env)
-
-    def git(self, repo_name, *args):
-        p = subprocess.Popen(['git'] + list(args), env=self.get_repo_env(repo_name),
+        cmd = ['git'] + list(args)
+        self.logger.info('running: %s' % cmd)
+        p = subprocess.Popen(cmd, env=env,
                              stdout=subprocess.PIPE, stdin=subprocess.PIPE,
                              stderr=subprocess.PIPE)
         out, err = p.communicate()
         return p.returncode, out, err
 
     def checked_git(self, repo_name, *args):
+        if args[0] in ['ls-remote', 'fetch']:
+            error_dispatch=RemoteFetchError
+        else:
+            error_dispatch=RuntimeError
         retcode, out, err = self.git(repo_name, *args)
         # Just fetch the output
         if retcode != 0:
-            raise RuntimeError('git call %r failed with code %d' % (args, retcode))
+            msg = 'git call %r failed with code %d:\n%s' % (args, retcode, err)
+            self.logger.error(msg)
+            raise error_dispatch(msg)
         return out
 
-    def get_repo_env(self, repo_name):
-        repo_path = pjoin(self.repo_path, repo_name)
-        if not os.path.exists(repo_path):
-            # TODO: This is not race-safe
-            os.makedirs(repo_path)
-            self.checked_git(repo_name, 'init', '--bare', '-q', repo_path)
+    def get_bare_repo_path(self, repo_name):
+        return pjoin(self.repo_path, repo_name)
+
+    def get_repo_env(self, repo_name=None):
         env = dict(os.environ)
-        env['GIT_DIR'] = repo_path
+        if repo_name:
+            repo_path = self.get_bare_repo_path(repo_name)
+            if not os.path.exists(repo_path):
+                # TODO: This is not race-safe
+                os.makedirs(repo_path)
+                self.checked_git(repo_name, 'init', '--bare', '-q', repo_path)
+            env['GIT_DIR'] = repo_path
         return env
+
+    @contextlib.contextmanager
+    def _marked_commit(self, repo_name, commit):
+        """Create temporary branch reference to commit"""
+        mark = 'tempmark/%s' % commit
+
+        self._ensure_branch(repo_name, mark, commit)
+        try:
+            yield mark
+        finally:
+            self.checked_git(repo_name, 'branch', '-D', mark)
+
+    def _ensure_branch(self, repo_name, branch, commit):
+        retcode, out, err = self.git(repo_name, 'branch', branch, commit)
+        if retcode != 0:
+            # Did it already exist? If so we're good (except if hashdist gc runs
+            # at the same time...)
+            if not self._does_branch_exist(repo_name, branch):
+                raise RuntimeError('git branch failed with code %d: %s' % (retcode, err))
 
     def _resolve_remote_rev(self, repo_name, repo_url, rev):
         # Resolve the rev (if it is a branch/tag) to a commit hash
@@ -416,15 +468,10 @@ class GitSourceCache(object):
     def _does_branch_exist(self, repo_name, branch):
         retcode, out, err = self.git(repo_name,
                                      'show-ref', '--verify', '--quiet', 'refs/heads/%s' % branch)
-        return retcode == 0        
+        return retcode == 0
 
     def _mark_commit_as_in_use(self, repo_name, commit):
-        retcode, out, err = self.git(repo_name, 'branch', 'inuse/%s' % commit, commit)
-        if retcode != 0:
-            # Did it already exist? If so we're good (except if hashdist gc runs
-            # at the same time...)
-            if not self._does_branch_exist(repo_name, 'inuse/%s' % commit):
-                raise RuntimeError('git branch failed with code %d: %s' % (retcode, err))
+        self._ensure_branch(repo_name, 'inuse/%s' % commit, commit)
 
     def fetch(self, url, type, commit, repo_name):
         assert type == 'git'
@@ -459,13 +506,10 @@ class GitSourceCache(object):
             # branch-names at all since we merge all projects encountered into the
             # same repo
             commit = self._resolve_remote_rev(repo_name, repo_url, rev)
-            
+
         if rev is not None:
-            try:
-                self.git_interactive(repo_name, 'fetch', repo_url, rev)
-            except subprocess.CalledProcessError:
-                self.logger.error('failed command: git fetch %s %s' % (repo_url, rev))
-                raise
+            self.checked_git(repo_name, 'fetch', repo_url, rev)
+
         else:
             # when rev is None, fetch all the remote heads; seems like one must
             # do a separate ls-remote...
@@ -473,20 +517,19 @@ class GitSourceCache(object):
             heads = [line.split()[1] for line in out.splitlines() if line.strip()]
             # Fix for https://github.com/hashdist/python-hpcmp2/issues/57
             heads = [x for x in heads if not x.endswith("^{}")]
-            self.git_interactive(repo_name, 'fetch', repo_url, *heads)
-            
+            self.checked_git(repo_name, 'fetch', repo_url, *heads)
+
         if not self._has_commit(repo_name, commit):
             raise SourceNotFoundError('Repository "%s" did not contain commit "%s"' %
                                       (repo_url, commit))
 
-        # Create a branch so that 'git gc' doesn't collect it
-        self._mark_commit_as_in_use(repo_name, commit)
+
+        self._mark_commit_as_in_use(repo_name, commit)  # Create a branch so that 'git gc' doesn't collect it
+        self._fetch_submodules(repo_name, repo_url, commit)
 
         return 'git:%s' % commit
 
     def unpack(self, type, hash, target_path):
-        import tarfile
-        
         assert type == 'git'
 
         # We don't want to require supplying a repo name, so for now
@@ -504,15 +547,91 @@ class GitSourceCache(object):
         else:
             raise KeyNotFoundError('Source item not present: git:%s' % hash)
 
-        p = subprocess.Popen(['git', 'archive', '--format=tar', hash],
-                             env=self.get_repo_env(repo_name),
-                             stdout=subprocess.PIPE)
-        # open in stream mode with the "r|" mode
-        with closing(tarfile.open(fileobj=p.stdout, mode='r|')) as archive:
-            archive.extractall(target_path)
-        retcode = p.wait()
+        # We clone the repo with 'git clone --shared' and check out the hash
+        repo_path = self.get_bare_repo_path(repo_name)
+
+        with self._marked_commit(repo_name, hash) as branch:
+            with working_directory(target_path):
+                self.checked_git(None, 'init')
+                self.checked_git(None, 'fetch', repo_path, branch)
+                self.checked_git(None, 'checkout', hash)
+
+        # Check out any submodules:
+        # a) Pare .gitmodules
+        # b) For each submodule, put override of url .git/config to point to source cache
+        # c) git submodule update --init
+        with working_directory(target_path):
+            if os.path.exists('.gitmodules'):
+                submodules = self._parse_submodule_config(repo_name, '.gitmodules')
+                for key, submod in submodules.items():
+                    self.checked_git(None, 'config', 'submodule.%s.url' % key, self.get_bare_repo_path(submod['name']))
+                self.checked_git(None, 'submodule', 'update', '--init')
+
+    #
+    # Submodule support
+    #
+
+    def _parse_submodule_config(self, root_repo_name, filename):
+        out = self.checked_git(None, 'config', '-f', filename, '--list')
+
+        # Example from unit-test of 'out' at this stage:
+        # submodule.subdir/submod.path=subdir/submod
+        # submodule.subdir/submod.url=/tmp/tmpuj84SH
+        # submodule.submod.path=submod
+        # submodule.submod.url=/tmp/tmpuj84SH
+
+        # Parse this into the structure we need.
+        submodules = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            key, value = line.split('=')
+            if key.startswith('submodule.'):
+                key = key[len('submodule.'):]
+                for attrname in ['path', 'url']:
+                    if key.endswith('.' + attrname):
+                        key = key[:-len('.' + attrname)]
+                        submodules.setdefault(key, {})[attrname] = value
+                        break
+        # So we now have:
+        # {'subdir/submod': {'path': 'subdir/submod', 'url': '/tmp/tmpFYjDuO'},
+        # 'submod': {'path': 'submod', 'url': '/tmp/tmpFYjDuO'}}
+
+        # As our "repo_name" for each submodule we use a dotted repo-name under root_repo_name
+        for submod in submodules.values():
+            submod['name'] = root_repo_name + '.' + submod['path'].replace('/', '.').replace('\\', '.')
+        return submodules
+
+    def _fetch_submodules(self, repo_name, repo_url, commit):
+        # use 'git show' to extract .gitmodules from the right commit
+        retcode, out, err = self.git(repo_name, 'show', '%s:.gitmodules' % commit)
         if retcode != 0:
-            raise CalledProcessError('git error: %d' % retcode)
+            # No .gitmodules found
+            return
+        # the 'git config' tool needs to read the input from a file though...
+        temp_dir = tempfile.mkdtemp()
+        try:
+            modules_config = pjoin(temp_dir, 'temp_gitmodules')
+            with open(modules_config, 'w') as f:
+                f.write(out)
+            submodules = self._parse_submodule_config(repo_name, modules_config)
+        finally:
+            shutil.rmtree(temp_dir)
+
+        # Recursively fetch the submodules. We need to look up the
+        # commit using 'git ls-tree', since 'git submodule status'
+        # doesn't work on bare repositories.
+        for submod in submodules.values():
+            out = self.checked_git(repo_name, 'ls-tree', commit, submod['path'])
+            mode, type, commit_hash, file = out.split()
+            if type != 'commit':
+                msg = 'Expected a submodule, not a %s at %s' (type, submod['path'])
+                self.logger.error(msg)
+                raise RuntimeError(msg)
+            # safely turn relative URLs into absolute URLs (idempotent on absolute URLs)
+            absolute_submod_url = urlparse.urljoin(repo_url+'/', submod['url'])
+            self.fetch_git(absolute_submod_url, rev=None, repo_name=submod['name'], commit=commit_hash)
 
 
 SIMPLE_FILE_URL_RE = re.compile(r'^file:/?[^/]+.*$')
@@ -527,11 +646,14 @@ class ArchiveSourceCache(object):
     def __init__(self, source_cache):
         assert not isinstance(source_cache, str)
         self.source_cache = source_cache
+        self.files_path = source_cache.cache_path
         self.packs_path = source_cache._ensure_subdir(PACKS_DIRNAME)
+        self.mirrors = source_cache.mirrors
         self.logger = self.source_cache.logger
 
     def get_pack_filename(self, type, hash):
-        type_dir = pjoin(self.packs_path, type)
+        d = self.files_path if type == 'files' else self.packs_path
+        type_dir = pjoin(d, type)
         mkdir_if_not_exists(type_dir)
         return pjoin(type_dir, hash)
 
@@ -546,17 +668,23 @@ class ArchiveSourceCache(object):
         # Provide a special case for local files
         use_urllib = not SIMPLE_FILE_URL_RE.match(url)
         if not use_urllib:
-            stream = file(url[len('file:'):])
+            try:
+                stream = open(url[len('file:'):])
+            except IOError as e:
+                raise SourceNotFoundError(str(e))
         else:
             # Make request.
             sys.stderr.write('Downloading %s...\n' % url)
             try:
                 stream = urllib2.urlopen(url)
             except urllib2.HTTPError, e:
-                raise RuntimeError("urllib failed to download (code: %d): %s" %\
-                            (e.code, url))
+                msg = "urllib failed to download (code: %d): %s" % (e.code, url)
+                self.logger.error(msg)
+                raise RemoteFetchError(msg)
             except urllib2.URLError, e:
-                raise RuntimeError("urllib failed to download (reason: %s): %s" % (e.reason, url))
+                msg = "urllib failed to download (reason: %s): %s" % (e.reason, url)
+                self.logger.error(msg)
+                raise RemoteFetchError(msg)
 
         # Download file to a temporary file within self.packs_path, while hashing
         # it.
@@ -566,7 +694,10 @@ class ArchiveSourceCache(object):
             f = os.fdopen(temp_fd, 'wb')
             tee = HashingWriteStream(hashlib.sha256(), f)
             if use_urllib:
-                progress = ProgressBar(int(stream.headers["Content-Length"]))
+                if 'Content-Length' in stream.headers:
+                    progress = ProgressBar(int(stream.headers["Content-Length"]))
+                else:
+                    progress = ProgressSpinner()
             try:
                 n = 0
                 while True:
@@ -581,12 +712,14 @@ class ArchiveSourceCache(object):
                 f.close()
                 if use_urllib:
                     progress.finish()
-        except:
+        except Exception as e:
             # Remove temporary file if there was a failure
             os.unlink(temp_path)
-            raise
+            msg = "Unhandled Exception in Download: %s" % e
+            self.logger.error(msg)
+            raise RemoteFetchError(msg)
 
-        if not create_archive_handler(type).verify(temp_path):
+        if not create_archive_handler(type, self.logger).verify(temp_path):
             self.logger.error("File downloaded from '%s' is not a valid archive" % url)
             raise SourceNotFoundError("File downloaded from '%s' is not a valid archive" % url)
 
@@ -606,6 +739,17 @@ class ArchiveSourceCache(object):
     def contains(self, type, hash):
         return os.path.exists(self.get_pack_filename(type, hash))
 
+    def fetch_from_mirrors(self, type, hash):
+        for mirror in self.mirrors:
+            url = '%s/%s/%s/%s' % (mirror, PACKS_DIRNAME, type, hash)
+            try:
+                self._download_archive(url, type, hash)
+            except SourceNotFoundError:
+                continue
+            else:
+                return True # found it
+        return False
+
     def fetch(self, url, type, hash, repo_name):
         if type == 'files:':
             raise NotImplementedError("use the put() method to store raw files")
@@ -614,9 +758,14 @@ class ArchiveSourceCache(object):
 
     def fetch_archive(self, url, type, expected_hash):
         if expected_hash is not None:
-            if self.contains(type, expected_hash):
+            found = self.contains(type, expected_hash)
+            if not found:
+                found = self.fetch_from_mirrors(type, expected_hash)
+            if found:
                 return '%s:%s' % (type, expected_hash)
-        
+        return self._download_archive(url, type, expected_hash)
+
+    def _download_archive(self, url, type, expected_hash):
         type = self._ensure_type(url, type)
         temp_file, hash = self._download_and_hash(url, type)
         try:
@@ -642,7 +791,7 @@ class ArchiveSourceCache(object):
             with file(pack_filename, 'w') as f:
                 hit_pack(files, f)
         return key
-    
+
     def unpack(self, type, hash, target_dir):
         infile = self.open_file(type, hash)
         with infile:
@@ -651,7 +800,7 @@ class ArchiveSourceCache(object):
                 scatter_files(files, target_dir)
             else:
                 try:
-                    create_archive_handler(type).unpack(infile, target_dir, hash)
+                    create_archive_handler(type, self.logger).unpack(infile, target_dir, hash)
                 except SourceCacheError, e:
                     self.logger.error(str(e))
                     raise
@@ -669,7 +818,7 @@ class ArchiveSourceCache(object):
     #
     def _extract_hit_pack(self, f, key, target_dir):
         files = hit_unpack(f, key)
-        scatter_files(files, target_dir)        
+        scatter_files(files, target_dir)
 
 
 #
@@ -697,41 +846,58 @@ def common_path_prefix(paths):
 
 class TarballHandler(object):
     chunk_size = 16 * 1024
-    
+
+    def __init__(self, logger):
+        self.logger = logger
+
     def verify(self, filename):
         import tarfile
         try:
-            with closing(tarfile.open(filename, self.read_mode)) as archive:
-                # Just in case, make sure we can actually read the archive:
-                members = archive.getmembers()
-            return True
+            with closing(self.tarfileobj_from_name(filename)) as tarfileobj:
+                with closing(tarfile.open(fileobj=tarfileobj, mode=self.read_mode)) as archive:
+                    # Just in case, make sure we can actually read the archive:
+                    members = archive.getmembers()
+                return True
         except tarfile.ReadError:
             return False
 
     def unpack(self, infile, target_dir, hash):
         import tarfile
-        from StringIO import StringIO
         target_dir = os.path.abspath(target_dir)
 
         archive_data = infile.read()
         if format_digest(hashlib.sha256(archive_data)) != hash:
             raise CorruptSourceCacheError("Corrupted file: '%s'" % infile.name)
 
-        with closing(tarfile.open(fileobj=StringIO(archive_data), mode=self.read_mode)) as archive:
-            members = archive.getmembers()
-            prefix_len = len(common_path_prefix([member.name for member in members
-                                                 if member.type != tarfile.DIRTYPE]))
-            # Filter away too short directory entries, remove prefix,
-            # and prevent directory escape attacks
-            filtered_members = []
-            for member in members:
-                if len(member.name) <= prefix_len:
-                    continue
-                if not os.path.abspath(pjoin(target_dir, member.name)).startswith(target_dir):
-                    raise SecurityError("Archive attempted to break out of target dir "
-                                        "with filename: %s" % member.name)
-                member.name = member.name[prefix_len:]
-            archive.extractall(target_dir, members)
+        with closing(self.tarfileobj_from_data(archive_data)) as tarfileobj:
+            with closing(tarfile.open(fileobj=tarfileobj, mode=self.read_mode)) as archive:
+                members = archive.getmembers()
+                prefix_len = len(common_path_prefix([member.name for member in members
+                                                     if member.type != tarfile.DIRTYPE]))
+                filtered_members = []
+                for member in members:
+                    if len(member.name) <= prefix_len:
+                        continue
+                    try:
+                        member.name.decode('ascii', 'strict')
+                    except UnicodeDecodeError:
+                        self.logger.warning("Archive contained a non-ascii path: %s.  Skipping."
+                                            % member.name.decode('ascii', 'replace'))
+                        continue
+
+                    if not os.path.abspath(pjoin(target_dir, member.name)).startswith(target_dir):
+                        raise SecurityError("Archive attempted to break out of target dir "
+                                            "with filename: %s" % member.name)
+                    member.name = member.name[prefix_len:]
+                    filtered_members.append(member)
+                archive.extractall(target_dir, filtered_members)
+
+    def tarfileobj_from_name(self, filename):
+        return open(filename, 'r');
+
+    def tarfileobj_from_data(self, archive_data):
+        from StringIO import StringIO
+        return StringIO(archive_data)
 
 
 class TarGzHandler(TarballHandler):
@@ -745,9 +911,32 @@ class TarBz2Handler(TarballHandler):
     exts = ['tar.bz2', 'tb2', 'tbz2']
     read_mode = 'r:bz2'
 
+class TarXzHandler(TarballHandler):
+    type = 'tar.xz'
+    exts = ['tar.xz']
+    read_mode = 'r'
+
+    # XXX: tarfile has built-in 'r:xz' support only in Python 3,
+    # XXX: so we use lzma module for Python 2 compatibility.
+
+    def tarfileobj_from_name(self, filename):
+        import lzma
+        return lzma.LZMAFile(filename)
+
+    def tarfileobj_from_data(self, archive_data):
+        # XXX: tarfile has built-in 'r:xz' support only in Python 3, so we use lzma module
+        # XXX: lzma.open() and lzma.LZMAFile() accept only file names, so we uncompress in memory
+        import lzma
+        from StringIO import StringIO
+        return StringIO(lzma.LZMADecompressor().decompress(archive_data))
+
 class ZipHandler(object):
     type = 'zip'
     exts = ['zip']
+
+    def __init__(self, logger):
+        self.logger = logger
+
     def verify(self, filename):
         from zipfile import ZipFile
         with closing(ZipFile(filename)) as f:
@@ -768,22 +957,23 @@ class ZipHandler(object):
             # during extraction
             prefix_len = len(common_path_prefix([info.filename for info in infolist]))
             for info in infolist:
-                info.filename = info.filename[prefix_len:]
-                f.extract(info, target_dir)
-        
+                if len(info.filename) > prefix_len:
+                    info.filename = info.filename[prefix_len:]
+                    f.extract(info, target_dir)
+
 archive_ext_to_type = {}
 archive_handler_classes = {}
 archive_types = []
-for cls in [TarGzHandler, TarBz2Handler, ZipHandler]:
+for cls in [TarGzHandler, TarBz2Handler, TarXzHandler, ZipHandler]:
     for ext in cls.exts:
         archive_ext_to_type[ext] = cls.type
     archive_handler_classes[cls.type] = cls
     archive_types.append(cls.type)
 archive_types = sorted(archive_types)
 
-        
-def create_archive_handler(type):
-    return archive_handler_classes[type]()
+
+def create_archive_handler(type, logger):
+    return archive_handler_classes[type](logger)
 
 def hit_pack(files, stream=None):
     """
@@ -859,7 +1049,7 @@ def hit_unpack(stream, key):
     if digest != format_digest(tee):
         raise CorruptSourceCacheError('hit-pack does not match key "%s"' % key)
     return files
-        
+
 def scatter_files(files, target_dir):
     """
     Given a list of filenames and their contents, write them to the file system.
@@ -896,4 +1086,3 @@ def silent_unlink(path):
         os.unlink(temp_file)
     except:
         pass
-

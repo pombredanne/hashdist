@@ -1,9 +1,8 @@
-Hashdist
+HashDist
 ========
 
-Note: ``master`` is the development branch.
-
-The ``stable`` branch contains the latest release (currently 0.1).
+**Home Page**:
+    https://hashdist.github.io/
 
 **Docs**:
     http://hashdist.readthedocs.org/
@@ -18,34 +17,42 @@ The ``stable`` branch contains the latest release (currently 0.1).
     https://groups.google.com/forum/?fromgroups#!forum/hashdist
 
 **Authors:**
-    Dag Sverre Seljebotn,
+    Aron Ahmadia,
+    Volker Braun,
     Ondrej Certik,
     Chris Kees,
-    Fernando Perez
+    Fernando Perez,
+    Dag Sverre Seljebotn,
+    Andy Terrel
 
 **Funding:**
-    Hashdist is partially funded by the International Research Office,
+    HashDist is partially funded by the International Research Office,
     US Army Engineer Research and Development Center, BAA contract
     W911NF-12-1-0604
 
-
+Note: ``master`` is the development branch.
 
 Copyright and license
 ---------------------
 
-Copyright (c) 2012, Dag Sverre Seljebotn and Ondrej Certik. All rights
+Copyright (c) 2012-2014, HashDist Developers. All rights
 reserved.
 
-Hashdist is licensed under the BSD 3-clause license. See LICENSE.txt
+HashDist is licensed under the BSD 3-clause license. See LICENSE.txt
 for full details.
 
-Since Hashdist is used as the installation tool, some very small
-dependencies are simply ripped out of the original projects and
-bundled under ``hashdist/deps``. The copyright of these belong to the
+Since HashDist is used as a standalone installation tool, some very small
+dependencies are bundled under ``hashdist/deps``. The copyright of these belong to the
 respective authors; the licenses are included in LICENSE.txt.
 
  * argparse
      * version: 1.2.1
+
+ * jsonschema
+     * version: 2.1.0
+     * author: Julian Berman
+     * license: MIT
+     * github: https://github.com/Julian/jsonschema
 
  * sh
      * location: hashdist/deps/sh:

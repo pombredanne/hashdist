@@ -40,7 +40,7 @@ class CreateLinks(object):
     one can use.
 
     If the 'launcher' action is used, then the 'LAUNCHER' environment
-    variable should be set; the launcher will be found in $LAUNCHER/bin/launcher.
+    variable should be set to the launcher binary.
     """
 
     command = 'create-links'
@@ -54,18 +54,17 @@ class CreateLinks(object):
     def run(ctx, args):
         from ..core.links import execute_links_dsl
 
-        launcher_prefix = ctx.env.get('LAUNCHER', None)
-        launcher = None if launcher_prefix is None else pjoin(launcher_prefix, 'bin', 'launcher')
+        launcher = ctx.env.get('LAUNCHER', None)
         doc = fetch_parameters_from_json(args.input, args.key)
         execute_links_dsl(doc, ctx.env, launcher, logger=ctx.logger)
 
 @register_subcommand
 class BuildUnpackSources(object):
     """
-    Extracts a set of sources as described in a ``build.json`` spec
+    Extract a set of sources as described in a ``build.json`` spec.
 
     Extraction is to  the current directory. Example specification::
-        
+
         {
             ...
            "sources" : [
@@ -89,7 +88,7 @@ class BuildUnpackSources(object):
         already extracted contents will not be removed, so one should
         always extract into a temporary directory, and recursively
         remove it if there was a failure.
-        
+
     """
 
     command = 'build-unpack-sources'
@@ -102,7 +101,7 @@ class BuildUnpackSources(object):
     @staticmethod
     def run(ctx, args):
         from ..core.build_store import unpack_sources
-        source_cache = SourceCache.create_from_config(ctx.config, ctx.logger)
+        source_cache = SourceCache.create_from_config(ctx.get_config(), ctx.logger)
         doc = fetch_parameters_from_json(args.input, args.key)
         unpack_sources(ctx.logger, source_cache, doc, '.')
 
@@ -137,7 +136,7 @@ class BuildWriteFiles(object):
 
     * **target**: Target filename. Variable substitution is performed,
       so it is possible to put ``$ARTIFACT/filename`` here.
-      
+
     * **text**: Contents as a list of lines which will be joined with "\\n".
 
     * **object**: As an alternative to *text*, one can provide an object
@@ -149,7 +148,7 @@ class BuildWriteFiles(object):
       (defaults to False)
 
     Order does not affect hashing. Files will always be encoded in UTF-8.
-        
+
     """
 
     command = 'build-write-files'
@@ -181,49 +180,18 @@ class BuildWhitelist(object):
     def run(ctx, args):
         from ..core.build_tools import build_whitelist, get_import_envvar
         artifacts = get_import_envvar(ctx.env)
-        build_store = BuildStore.create_from_config(ctx.config, ctx.logger)
+        build_store = BuildStore.create_from_config(ctx.get_config(), ctx.logger)
         sys.stdout.write('%s\n' % pjoin(build_store.get_build_dir(), '**'))
         sys.stdout.write('/tmp/**\n')
         sys.stdout.write('/etc/**\n')
         build_whitelist(build_store, artifacts, sys.stdout)
 
 @register_subcommand
-class BuildProfile(object):
-    """
-    A temporary profile for use during builds.
-
-    pop removes all the files again, and any directories that are now empty
-    """
-
-    command = 'build-profile'
-
-    @staticmethod
-    def setup(ap):
-        ap.add_argument('action', choices=['push', 'pop'])
-
-    @staticmethod
-    def run(ctx, args):
-        from ..core.build_tools import push_build_profile, pop_build_profile
-        from ..core.run_job import unpack_virtuals_envvar
-        virtuals = unpack_virtuals_envvar(ctx.env.get('HDIST_VIRTUALS', ''))
-        manifest = pjoin(ctx.env['BUILD'], 'temp_build_profile_manifest.json')
-        if args.action == 'push':
-            push_build_profile(ctx.config,
-                               ctx.logger,
-                               virtuals,
-                               pjoin(ctx.env['BUILD'], 'build.json'),
-                               manifest,
-                               ctx.env['ARTIFACT'])
-        elif args.action == 'pop':
-            pop_build_profile(manifest, ctx.env['ARTIFACT'])
-        else:
-            assert False
-
-@register_subcommand
 class BuildPostprocess(object):
     """
-    Walks through directories to perform the actions given by flags
-    (to be used after the build process). Default pat is the one
+    Walk through directories to perform the actions given by flags.
+
+    To be used after the build process. Default path is the one
     given by ``$ARTIFACT``.
 
     --shebang=$technique:
@@ -231,11 +199,11 @@ class BuildPostprocess(object):
         All scripts (executables starting with #!) are re-wired to
         a) if within a profile, launch the interpreter of the profile,
         b) if not in a profile, launch the interpreter using a relative
-        path instead of absolute one to make the artifact relocateable.
+        path instead of absolute one to make the artifact relocatable.
 
         The technique used depends on the value; multiline will use a
         polyglot script fragment to insert a 'multi-line shebang',
-        while 'launcher' will use the Hashdist 'launcher' tool. The
+        while 'launcher' will use the HashDist 'launcher' tool. The
         latter looks for the path to the 'launcher' artifact in the
         LAUNCHER environment variable.
 
@@ -243,6 +211,50 @@ class BuildPostprocess(object):
 
         Remove all 'w' mode bits.
 
+    --relative-rpath:
+
+        Patches the RPATH of all executables to turn them from
+        absolute RPATHS to relative RPATHS. The details vary across
+        platforms, but the goal is to make the artifact
+        relocatable. If relocatability is not supported for the
+        platform, the command exists silently.
+
+    --relative-symlinks:
+
+        Rewrites absolute symlinks pointing within the $ARTIFACT
+        as relative symlinks, and gives an error on symlinks pointing
+        out of the artifact.
+
+    --remove-pkgconfig:
+
+        Remove pkgconfig files as they are not relocatable (at least
+        yet)
+
+    --relative-pkgconfig:
+
+       Replace the (absolute) artifact directory in the pc files with
+       a ``PACKAGE_DIR`` variable. This variable must then be defined
+       using ``pkg-config --define-variable=FOO_DIR=artifact_dir``
+       when calling pkg-config later on. Hashstack contains a
+       pkg-config wrapper script to do this.
+
+    --relative-sh-script=pattern
+
+        Files that matches 'pattern' will be modified so that
+        references to $ARTIFACT will be replaced with a path relative
+        from the script location. For instance, use the pattern
+        `bin/.*-config` to match config-scripts. Code will be inserted
+        at top introducing a hashdist_artifact variable in the script,
+        and then references to $ARTIFACT will be
+
+    --check-relocatable
+
+        Complain loudly if the full path ${ARTIFACT} string is found
+        anywhere within the artifact.
+
+    --check-ignore=REGEX
+
+        Ignore filenames matching REGEX for the relocatability check
     """
     command = 'build-postprocess'
 
@@ -250,6 +262,13 @@ class BuildPostprocess(object):
     def setup(ap):
         ap.add_argument('--shebang', choices=['multiline', 'launcher', 'none'], default='none')
         ap.add_argument('--write-protect', action='store_true')
+        ap.add_argument('--relative-rpath', action='store_true')
+        ap.add_argument('--remove-pkgconfig', action='store_true')
+        ap.add_argument('--relative-pkgconfig', action='store_true')
+        ap.add_argument('--relative-sh-script', action='append')
+        ap.add_argument('--relative-symlinks', action='store_true')
+        ap.add_argument('--check-relocatable', action='store_true')
+        ap.add_argument('--check-ignore', action='append')
         ap.add_argument('--pyc', action='store_true')
         ap.add_argument('path', nargs='?', help='dir/file to post-process (dirs are handled '
                         'recursively)')
@@ -259,10 +278,10 @@ class BuildPostprocess(object):
         from ..core import build_tools
         from ..core import BuildStore
         handlers = []
-        
+
         if args.shebang == 'launcher':
             try:
-                launcher = pjoin(ctx.env['LAUNCHER'], 'bin', 'launcher')
+                launcher = ctx.env['LAUNCHER']
             except KeyError:
                 ctx.logger.error('LAUNCHER environment variable not set')
                 raise
@@ -272,12 +291,45 @@ class BuildPostprocess(object):
             handlers.append(partial(build_tools.postprocess_launcher_shebangs,
                                     launcher_program=launcher))
         elif args.shebang == 'multiline':
-            build_store = BuildStore.create_from_config(ctx.config, ctx.logger)
+            build_store = BuildStore.create_from_config(ctx.get_config(), ctx.logger)
             handlers.append(partial(build_tools.postprocess_multiline_shebang,
                                     build_store))
 
+        if (args.relative_sh_script or args.check_relocatable or
+            args.relative_symlinks or args.relative_pkgconfig):
+            if 'ARTIFACT' not in ctx.env:
+                ctx.logger.error('ARTIFACT environment variable not set')
+            artifact_dir = ctx.env['ARTIFACT']
+
+        if args.relative_rpath:
+            build_store = BuildStore.create_from_config(ctx.get_config(), ctx.logger)
+            handlers.append(lambda filename: build_tools.postprocess_rpath(ctx.logger, build_store.artifact_root,
+                                                                           ctx.env, filename))
+
+        if args.relative_sh_script:
+            handlers.append(lambda filename: build_tools.postprocess_sh_script(ctx.logger,
+                                                                               args.relative_sh_script,
+                                                                               artifact_dir,
+                                                                               filename))
+
+        if args.relative_symlinks:
+            handlers.append(lambda filename: build_tools.postprocess_relative_symlinks(ctx.logger, artifact_dir,
+                                                                                       filename))
+
+        if args.remove_pkgconfig:
+            handlers.append(lambda filename: build_tools.postprocess_remove_pkgconfig(
+                ctx.logger, filename))
+
+        if args.relative_pkgconfig:
+            handlers.append(lambda filename: build_tools.postprocess_relative_pkgconfig(
+                ctx.logger, artifact_dir, filename))
+
+        if args.check_relocatable:
+            handlers.append(lambda filename: build_tools.check_relocatable(ctx.logger, args.check_ignore,
+                                                                            artifact_dir, filename))
+
         if args.write_protect:
-            handlers.append(build_tools.postprocess_write_protect)
+            handlers.append(build_tools.write_protect)
 
         if args.path is None:
             try:
@@ -286,15 +338,18 @@ class BuildPostprocess(object):
                 ctx.logger.error('path not given and ARTIFACT environment variable not set')
                 raise
 
-        # we traverse post-order so that write-protection of
-        # directories happens very last.  (Although, currently only
-        # files are write-protected so that rm -rf works.)
-        if os.path.isfile(args.path):
+        def apply_handlers(path):
             for handler in handlers:
-                handler(args.path)
+                handler(path)
+                if not os.path.exists(path):
+                    return   # handler deleted file
+
+        # we traverse post-order so that write-protection of
+        # directories happens very last
+        if os.path.isfile(args.path):
+            apply_handlers(args.path)
         else:
             for dirpath, dirnames, filenames in os.walk(args.path, topdown=False):
-                for filename in filenames + [dirpath]:
-                    for handler in handlers:
-                        handler(pjoin(dirpath, filename))
-        
+                for filename in filenames:
+                    apply_handlers(pjoin(dirpath, filename))
+                apply_handlers(dirpath)

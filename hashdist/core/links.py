@@ -25,7 +25,7 @@ more easily with the `overwrite` flag)::
       "prefix": "/usr",
       "target": "$ARTIFACT"
     }
-    
+
   ]
 
 Rules are executed in order. If a target file already exists, nothing
@@ -33,10 +33,11 @@ happens.
 
 
 **action**:
-  One of "absolute_symlink", "relative_symlink", "copy", "exclude",
-  "launcher". Other types may be added later.
+  One of "symlink", "absolute_symlink", "relative_symlink", "copy",
+  "exclude", "launcher". Other types may be added later.
 
-  * *absolute_symlink* creates absolute symlinks
+  * *absolute_symlink* creates absolute symlinks. Just *symlink* is an
+    alias for absolute symlink.
   * *relative_symlink* creates relative symlinks
   * *copy* copies contents and mode (``shutil.copy``)
   * *exclude* makes sure matching files are not considered in rules below
@@ -68,8 +69,6 @@ happens.
 
 **overwrite**:
   If present and `True`, overwrite target.
-
-
 """
 
 import sys
@@ -77,11 +76,11 @@ import os
 from os.path import join as pjoin
 import shutil
 import errno
+import logging
 from string import Template
 
 from .fileutils import (silent_makedirs, silent_unlink, silent_relative_symlink,
                         silent_absolute_symlink, silent_copy)
-from ..hdist_logging import null_logger
 
 from .ant_glob import ant_iglob
 
@@ -100,8 +99,8 @@ def make_launcher(src, dst, launcher_program):
         and "$dst.link" is set up to point relatively to "$src".
 
     symlink:
-        Copy it verbatim. Thus, e.g., ``python -> python2.7'' will point to the
-        newly, "launched-ified" ``python2.7''.
+        Copy it verbatim. Thus, e.g., ``python -> python2.7`` will point to the
+        newly, "launched-ified" ``python2.7``.
 
     other (incl. scripts):
         Symlink relatively to it.
@@ -129,7 +128,7 @@ def make_launcher(src, dst, launcher_program):
         os.symlink('launcher', dst)
     else:
         os.symlink(os.path.relpath(src, dstdir), dst)
-        
+
 
 _ACTIONS = {'symlink': silent_absolute_symlink,
             'relative_symlink': silent_relative_symlink,
@@ -149,7 +148,7 @@ def _put_actions(makedirs_cache, action_name, overwrite, source, dest, actions):
     except KeyError:
         raise ValueError('Unknown action: %s' % action_name)
 
-    
+
 def _glob_actions(rule, excluded, makedirs_cache, env, actions):
     select = rule['select']
     if not isinstance(select, (list, tuple)):
@@ -228,16 +227,16 @@ def dry_run_links_dsl(rules, env={}):
             _glob_actions(rule, excluded, makedirs_cache, env, actions)
         else:
             _single_action(rule, excluded, makedirs_cache, env, actions)
-    
+
     return actions
 
 
-def execute_links_dsl(rules, env={}, launcher_program=None, logger=null_logger):
+def execute_links_dsl(rules, env={}, launcher_program=None, logger=None):
     """Executes the links DSL for linking/copying files
-    
+
     The input is a set of rules which will be applied in order. The
     rules are documented above.
-    
+
     Parameters
     ----------
 
@@ -251,9 +250,11 @@ def execute_links_dsl(rules, env={}, launcher_program=None, logger=null_logger):
         If the 'launcher' action is used, the path to the launcher executable
         must be provided.
 
-    logger : Logger
+    logger : Logger or ``None`` (default)
 
     """
+    if logger is None:
+        logger = logging.getLogger('null_logger')
     actions = dry_run_links_dsl(rules, env)
     for action in actions:
         action_desc = "%s%r" % (action[0].__name__, action[1:])

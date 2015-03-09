@@ -1,0 +1,15 @@
+extends:
+- file: base.yaml
+
+package_dirs:
+- .
+
+hook_import_dirs:
+- hooks
+
+packages:
+  original:
+    use: alternate
+
+  origdirectory:
+    use: altdirectory

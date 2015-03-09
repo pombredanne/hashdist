@@ -7,17 +7,19 @@ import hashlib
 from StringIO import StringIO
 import stat
 import errno
+import logging
 from contextlib import closing
 
 pjoin = os.path.join
 
 from ..source_cache import (ArchiveSourceCache, SourceCache,
         CorruptSourceCacheError, hit_pack, hit_unpack, scatter_files,
-        KeyNotFoundError, SourceNotFoundError, SecurityError)
+        KeyNotFoundError, SourceNotFoundError, SecurityError, RemoteFetchError)
 from ..hasher import Hasher, format_digest
 
-from .utils import temp_dir, working_directory, VERBOSE, logger, assert_raises, MemoryLogger
+from .utils import temp_dir, working_directory, VERBOSE, logger, assert_raises
 from . import utils
+from hashdist.util.logger_fixtures import log_capture
 
 from nose.tools import eq_
 
@@ -38,17 +40,16 @@ def temp_source_cache(logger=logger):
     try:
         yield SourceCache(tempdir, logger)
     finally:
-        shutil.rmtree(tempdir)    
+        shutil.rmtree(tempdir)
 
 
 def setup():
     global mock_git_repo, mock_git_commit, mock_git_devel_branch_commit, mock_container_dir
-    mock_git_repo = tempfile.mkdtemp()
     mock_container_dir = tempfile.mkdtemp()
-    mock_git_commit, mock_git_devel_branch_commit = make_mock_git_repo()
+    mock_git_repo, mock_git_commit, mock_git_devel_branch_commit = make_mock_git_repo(mock_git_repo)
     make_mock_tarball()
     make_mock_zipfile()
-        
+
 def teardown():
     shutil.rmtree(mock_git_repo)
     shutil.rmtree(mock_tarball_tmpdir)
@@ -58,14 +59,14 @@ def teardown():
 
 def make_mock_tarball():
     import tarfile
-    
+
     global mock_tarball, mock_tarball_tmpdir, mock_tarball_hash
     global mock_dangerous_tarballs
 
     mock_tarball_tmpdir, mock_tarball,  mock_tarball_hash = utils.make_temporary_tarball(
         [('a/b/0/README', 'file contents'),
          ('a/b/1/README', 'file contents')])
-    
+
     import tarfile
     mock_dangerous_tarballs = [pjoin(mock_container_dir, 'danger%d.tar.gz' % i) for i in range(2)]
     contentsfile = pjoin(mock_container_dir, 'tmp')
@@ -88,14 +89,14 @@ def make_mock_zipfile():
         z.writestr(pjoin('a', 'b', '1', 'README'), 'file contents')
     with open(mock_zipfile) as f:
         mock_zipfile_hash = 'zip:' + format_digest(hashlib.sha256(f.read()))
-    
+
 
 # Mock git repo
 
 def git(*args, **kw):
     repo = kw['repo']
     git_env = dict(os.environ)
-    git_env['GIT_DIR'] = repo
+    git_env['CWD'] = repo
     p = subprocess.Popen(['git'] + list(args), env=git_env, stdout=subprocess.PIPE,
                          stderr=None if VERBOSE else subprocess.PIPE)
     out, err = p.communicate()
@@ -107,12 +108,21 @@ def cat(filename, what):
     with file(filename, 'w') as f:
         f.write(what)
 
-def make_mock_git_repo():
+def make_mock_git_repo(submodules=None):
+    mock_git_repo = tempfile.mkdtemp()
     with working_directory(mock_git_repo):
         repo = os.path.join(mock_git_repo, '.git')
         git('init', repo=repo)
         cat('README', 'First revision')
         git('add', 'README', repo=repo)
+        if submodules:
+            #config = '\n'.join(
+            #    '[submodule "%s"]        path = %s\n        url = %s\n' % (name, name, url)
+            #    for name, url in submodules.items())
+            #cat('.gitmodules', config)
+            #git('add', '.gitmodules')
+            for name, url in submodules.items():
+                git('submodule', 'add', url, name, repo=repo)
         git('commit', '-m', 'First revision', repo=repo)
         master_commit = git('rev-list', '-n1', 'HEAD', repo=repo).strip()
         cat('README', 'Second revision')
@@ -120,7 +130,7 @@ def make_mock_git_repo():
         git('add', 'README', repo=repo)
         git('commit', '-m', 'Second revision', repo=repo)
         devel_commit = git('rev-list', '-n1', 'HEAD', repo=repo).strip()
-        return master_commit, devel_commit
+        return mock_git_repo, master_commit, devel_commit
 
 #
 # Tests
@@ -130,7 +140,7 @@ def test_common_prefix():
     from ..source_cache import common_path_prefix
     def f(lst):
         return common_path_prefix([pjoin(*x.split('/')) for x in lst])
-    
+
     eq_('a/b/c/d/', f(['a/b/c/d/e']))
     eq_('a/', f(['a/c', 'a/d']))
     eq_('a/b/', f(['a/b/c', 'a/b/d']))
@@ -140,14 +150,15 @@ def test_common_prefix():
 
 
 def test_trap_tarball_attack():
-    logger = MemoryLogger()
+    logger = logging.getLogger()
     with temp_source_cache(logger) as sc:
         for tb in mock_dangerous_tarballs:
-            key = sc.fetch_archive('file:' + tb)
-            with temp_dir() as d:
-                with assert_raises(SecurityError):
-                    sc.unpack(key, d)
-                assert any('attempted to break out' in line for line in logger.lines)
+            with log_capture() as logger:
+                key = sc.fetch_archive('file:' + tb)
+                with temp_dir() as d:
+                    with assert_raises(SecurityError):
+                        sc.unpack(key, d)
+            logger.assertLogged('^ERROR:.*attempted to break out')
 
 def test_tarball():
     with temp_source_cache() as sc:
@@ -171,15 +182,15 @@ def test_zipfile():
                 assert f.read() == 'file contents'
             with file(pjoin(d, '1', 'README')) as f:
                 assert f.read() == 'file contents'
-            
+
 
 def test_curl_errors():
     with temp_source_cache() as sc:
         with assert_raises(ValueError):
             sc.fetch_archive('/tmp/foo/garbage.tar.gz') # malformed, would need file: prefix
-        with assert_raises(RuntimeError):
+        with assert_raises(RemoteFetchError):
             sc.fetch_archive('http://localhost:999/foo.tar.gz')
-    
+
 
 def test_stable_archive_hash():
     fixed_tarball = pjoin(os.path.dirname(__file__), 'archive.tar.gz')
@@ -200,6 +211,14 @@ def test_git_fetch_git():
             sc.unpack(key, pjoin(d, 'foo'))
             with file(pjoin(d, 'foo', 'README')) as f:
                 assert f.read() == 'First revision'
+            # The unpack should be a git checkout positioned in the right commit
+            with working_directory(pjoin(d, 'foo')):
+                assert os.path.isdir('.git')
+                p = subprocess.Popen(['git', 'rev-parse', 'HEAD'], stdout=subprocess.PIPE,
+                                     stderr=None if VERBOSE else subprocess.PIPE)
+                out, err = p.communicate()
+                assert p.wait() == 0
+                assert out.strip() == mock_git_commit
 
 def test_git_fetch():
     with temp_source_cache() as sc:
@@ -207,6 +226,24 @@ def test_git_fetch():
         sc.fetch(mock_git_repo, 'git:' + mock_git_devel_branch_commit, 'foo')
         sc.fetch('git://not-valid', 'git:' + mock_git_commit, 'foo')
         sc.fetch(None, 'git:' + mock_git_commit, 'foo')
+
+def test_git_fetch_submodules():
+    root_repo, master_commit, devel_commit = make_mock_git_repo(submodules={'subdir/submod': mock_git_repo,
+                                                                            'submod': mock_git_repo})
+    with temp_source_cache() as sc:
+        # A 'fetch' should recursively fetch the submodules and give them dotted names
+        sc.fetch(root_repo, 'git:' + master_commit, 'rootproject')
+        assert (os.listdir(pjoin(sc.cache_path, 'git')).sort() ==
+                ['rootproject', 'rootproject.submod', 'rootproject.subdir.submod'].sort())
+        # An unpack should include the submodules
+        with temp_dir() as d:
+            sc.unpack('git:' + master_commit, d)
+            for path, content in {('README',): 'First revision',
+                                  ('submod', 'README'): 'Second revision',
+                                  ('subdir', 'submod', 'README'): 'Second revision'}.items():
+                with open(pjoin(d, *path)) as f:
+                    s = f.read()
+                    assert s == content
 
 def test_unpack_nonexisting_git():
     with temp_source_cache() as sc:
@@ -219,7 +256,7 @@ def test_unpack_nonexisting_tarball():
         with temp_dir() as d:
             with assert_raises(KeyNotFoundError):
                 sc.unpack('tar.gz:4niostz3iktlg67najtxuwwgss5vl6k4', pjoin(d, 'bar'))
-            
+
 def test_able_to_fetch_twice():
     # With 'master' rev
     with temp_source_cache() as sc:
@@ -342,3 +379,17 @@ def test_corrupt_archive():
                 sc.fetch_archive('file:' + archive_path1)
             with assert_raises(SourceNotFoundError):
                 sc.fetch_archive('file:' + archive_path2)
+
+def test_mirrors():
+    with temp_dir() as sc_dir:
+        with temp_dir() as mirror1:
+            with temp_dir() as mirror2:
+                destdir = pjoin(mirror2, 'packs', 'tar.gz')
+                sha = mock_tarball_hash.split(':')[1]
+                os.makedirs(destdir)
+                shutil.copy(mock_tarball, pjoin(destdir, sha))
+
+                sc = SourceCache(sc_dir, logger, mirrors=['file:' + mirror1, 'file:' + mirror2])
+                sc.fetch('http://nonexisting.com', mock_tarball_hash)
+                assert [sha] == os.listdir(pjoin(sc_dir, 'packs', 'tar.gz'))
+

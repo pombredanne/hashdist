@@ -12,9 +12,16 @@ import textwrap
 import os
 import json
 import traceback
+import errno
 
-from ..core import load_configuration_from_inifile, DEFAULT_CONFIG_FILENAME
-from ..hdist_logging import Logger, DEBUG, INFO
+from ..formats.config import (load_config_file, DEFAULT_CONFIG_FILENAME_REPR, DEFAULT_CONFIG_FILENAME,
+                              ValidationError)
+from ..formats.marked_yaml import ValidationError
+from ..core.source_cache import RemoteFetchError
+
+import logging
+logger = logging.getLogger()
+from hashdist.util.logger_setup import set_log_level, configure_logging, has_error_occurred
 
 try:
     import argparse
@@ -42,15 +49,41 @@ def register_subcommand(cls, command=None):
     if command is None:
         name = getattr(cls, 'command', cls.__name__.lower())
     _subcommands[name] = cls
+    return cls
 
-class HashdistCommandContext(object):
-    def __init__(self, argparser, subcommand_parsers, out_stream, config, env, logger):
+class HashDistCommandContext(object):
+    def __init__(self, argparser, subcommand_parsers, out_stream, config_filename, env, logger):
         self.argparser = argparser
         self.subcommand_parsers = subcommand_parsers
         self.out_stream = out_stream
-        self.config = config
         self.env = env
         self.logger = logger
+        self._config_filename = config_filename
+        self._config = None
+
+    def _ensure_home(self):
+        from .manage_store_cli import InitHome
+        InitHome.run(self, None)
+
+    def _ensure_config(self):
+        if self._config_filename is None and 'HDIST_CONFIG' in self.env:
+            self._config = json.loads(env['HDIST_CONFIG'])
+        else:
+            try:
+                config = load_config_file(self._config_filename, self.logger)
+            except IOError as e:
+                if e.errno == errno.ENOENT:
+                    self.logger.info('Unable to find %s, running hit init-home.\n' % self._config_filename)
+                    self._ensure_home()
+                    config = load_config_file(self._config_filename, self.logger)
+                else:
+                    raise
+        self._config = config
+
+    def get_config(self):
+        if self._config is None:
+            self._ensure_config()
+        return self._config
 
     def error(self, msg):
         self.argparser.error(msg)
@@ -68,21 +101,42 @@ def _parse_docstring(doc):
     description = description.replace('::\n', ':\n').replace('``', '"')
     return help, description
 
-def main(unparsed_argv, env, logger, default_config_filename=None):
-    """The main ``hit`` command-line entry point
+def command_line_entry_point(unparsed_argv, env, default_config_filename=None, secondary=False):
     """
-    if default_config_filename is None:
-        default_config_filename = os.path.expanduser(DEFAULT_CONFIG_FILENAME)
+    The main ``hit`` command-line entry point
 
+    Arguments:
+    ----------
+
+    unparsed_argv : list of str
+        The unparsed command line arguments
+
+    env : dict
+        Environment
+
+    default_config_filename : unused (TODO)
+
+    secondary : boolean
+        Whether this is hit invoking itself. When set, avoids changing
+        configuration. This is a bit of a hack and should be done
+        better (TODO)
+    """
     description = textwrap.dedent('''
-    Entry-point for various Hashdist command-line tools
+    Entry-point for various HashDist command-line tools
     ''')
 
     parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config-file',
-                        help='Location of hashdist configuration file (default: %s)' % default_config_filename,
-                        default=None)
+                        help='Location of hashdist configuration file (default: %s)'
+                        % DEFAULT_CONFIG_FILENAME_REPR,
+                        default=DEFAULT_CONFIG_FILENAME)
+    parser.add_argument('--ipdb',
+                        help='Enable IPython debugging on error',
+                        action='store_true')
+    parser.add_argument('--log', default=None,
+                        help='One of [DEBUG, INFO, ERROR, WARNING, CRITICAL]')
+
     subparser_group = parser.add_subparsers(title='subcommands')
 
     subcmd_parsers = {}
@@ -93,8 +147,11 @@ def main(unparsed_argv, env, logger, default_config_filename=None):
             formatter_class=argparse.RawDescriptionHelpFormatter)
 
         cls.setup(subcmd_parser)
-        
-        subcmd_parser.set_defaults(subcommand_handler=cls.run, parser=parser)
+        subcmd_parser.add_argument('-v', '--verbose', action='store_true', help='More verbose output')
+
+
+        subcmd_parser.set_defaults(subcommand_handler=cls.run, parser=parser,
+                                   subcommand=name)
         # Can't find an API to access subparsers through parser? Pass along explicitly in ctx
         # (needed by Help)
         subcmd_parsers[name] = subcmd_parser
@@ -102,26 +159,25 @@ def main(unparsed_argv, env, logger, default_config_filename=None):
     if len(unparsed_argv) == 1:
         # Print help by default rather than an error about too few arguments
         parser.print_help()
-        retcode = 1
-    else:
-        args = parser.parse_args(unparsed_argv[1:])
-        if args.config_file is None and 'HDIST_CONFIG' in env:
-            config = json.loads(env['HDIST_CONFIG'])
-        else:
-            if args.config_file is None:
-                args.config_file = default_config_filename
-            config = load_configuration_from_inifile(args.config_file)
-        
-        ctx = HashdistCommandContext(parser, subcmd_parsers, sys.stdout, config, env, logger)
+        return 1
+    args = parser.parse_args(unparsed_argv[1:])
 
-        retcode = args.subcommand_handler(ctx, args)
-        if retcode is None:
-            retcode = 0
+    if not secondary:
+        configure_logging(args.log)
+        if args.verbose:
+            set_log_level('INFO')
+            if args.log is not None:
+                logger.warn('-v overrides --log to INFO')
 
+    ctx = HashDistCommandContext(parser, subcmd_parsers, sys.stdout, args.config_file, env, logger)
+
+    retcode = args.subcommand_handler(ctx, args)
+    if retcode is None:
+        retcode = 0
     return retcode
 
 
-def help_on_exceptions(logger, func, *args, **kw):
+def help_on_exceptions(func, *args, **kw):
     """Present exceptions in the form of a request to file an issue
 
     Calls func (typically a "main" function), and returns the return code.
@@ -133,20 +189,52 @@ def help_on_exceptions(logger, func, *args, **kw):
     raised anyway.
     """
     try:
+        debug = len(os.environ['DEBUG']) > 0
+    except KeyError:
+        debug = logging.getLogger().getEffectiveLevel() <= logging.DEBUG
+
+    if '--ipdb' in sys.argv:
+        from ipdb import launch_ipdb_on_exception
+        with launch_ipdb_on_exception():
+            return func(*args, **kw)
+
+    try:
         return func(*args, **kw)
+
     except KeyboardInterrupt:
-        logger.info('Interrupted')
-        return 127
-    except SystemExit:
-        raise
-    except:
-        if len(os.environ.get('DEBUG', '')) > 0:
+        if debug:
             raise
         else:
-            if not logger.error_occurred:
-                logger.error("Uncaught exception:")
+            logger.info('Interrupted')
+            return 127
+    except SystemExit:
+        raise
+    except ValidationError as e:
+        if debug:
+            raise
+        else:
+            logger.critical(str(e))
+            return 127
+    except IOError as e:
+        if debug:
+            raise
+        else:
+            logger.critical(str(e))
+            return 127
+    except RemoteFetchError as e:
+        if debug:
+            raise
+        else:
+            logger.critical("You may wish to check your Internet connection or the remote server")
+            return 127
+    except:
+        if debug:
+            raise
+        else:
+            if not has_error_occurred():
+                logger.critical("Uncaught exception:")
                 for line in traceback.format_exc().splitlines():
-                    logger.info(line)
+                    logger.critical(line)
                 text = """\
                 This exception has not been translated to a human-friendly error
                 message, please file an issue at
@@ -156,13 +244,14 @@ def help_on_exceptions(logger, func, *args, **kw):
                 text = textwrap.fill(textwrap.dedent(text), width=78)
                 logger.info('')
                 for line in text.splitlines():
-                    logger.info(line)
+                    logger.critical(line)
             return 127
-            
+
 #
 # help command
 #
 
+@register_subcommand
 class Help(object):
     """
     Displays help about sub-commands
@@ -182,8 +271,7 @@ class Help(object):
                 ctx.error('Unknown sub-command: %s' % args.command)
             subcmd_parser.print_help()
 
-register_subcommand(Help)
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv, os.environ))
+    sys.exit(command_line_entry_point(sys.argv, os.environ))

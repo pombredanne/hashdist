@@ -2,8 +2,10 @@
 
 import sys
 import os
-from hashdist.hdist_logging import Logger, DEBUG
-from hashdist.cli.main import main, help_on_exceptions
 
-logger = Logger(DEBUG)
-sys.exit(help_on_exceptions(logger, main, sys.argv, os.environ, logger))
+hashdist_dir = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))
+sys.path.insert(0, hashdist_dir)
+
+from hashdist.cli.main import command_line_entry_point, help_on_exceptions
+
+sys.exit(help_on_exceptions(command_line_entry_point, sys.argv, os.environ))

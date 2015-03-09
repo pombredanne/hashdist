@@ -8,17 +8,18 @@ Reference
 
 """
 
+import sys
 import os
 from os.path import join as pjoin
 import json
 from string import Template
 from textwrap import dedent
 import re
+import subprocess
 
 from .common import json_formatting_options
 from .build_store import BuildStore
-from .profile import make_profile
-from .fileutils import rmdir_empty_up_to, write_protect
+from .fileutils import rmdir_empty_up_to, write_protect, silent_unlink
 
 def execute_files_dsl(files, env):
     """
@@ -38,7 +39,7 @@ def execute_files_dsl(files, env):
     """
     def subs(x):
         return Template(x).substitute(env)
-    
+
     for file_spec in files:
         target = subs(file_spec['target'])
         # Automatically create parent directory of target
@@ -86,27 +87,6 @@ def recursive_list_files(dir):
             result.add(pjoin(root, fname))
     return result
 
-def push_build_profile(config, logger, virtuals, buildspec_filename, manifest_filename, target_dir):
-    files_before_profile = recursive_list_files(target_dir)
-    
-    with open(buildspec_filename) as f:
-        imports = json.load(f).get('build', {}).get('import', [])
-    build_store = BuildStore.create_from_config(config, logger)
-    make_profile(logger, build_store, imports, target_dir, virtuals, config)
-
-    files_after_profile = recursive_list_files(target_dir)
-    installed_files = files_after_profile.difference(files_before_profile)
-    with open(manifest_filename, 'w') as f:
-        json.dump({'installed-files': sorted(list(installed_files))}, f)
-
-def pop_build_profile(manifest_filename, root):
-    with open(manifest_filename) as f:
-        installed_files = json.load(f)['installed-files']
-    for fname in installed_files:
-        os.unlink(fname)
-        rmdir_empty_up_to(os.path.dirname(fname), root)
-
-
 #
 # Tools to use on individual files for postprocessing
 #
@@ -115,11 +95,11 @@ def is_executable(filename):
     return os.stat(filename).st_mode & 0o111 != 0
 
 def postprocess_launcher_shebangs(filename, launcher_program):
-    if not os.path.isfile(filename):
+    if not os.path.isfile(filename) or os.path.islink(filename):
         return
     if 'bin' not in filename:
         return
-    
+
     if is_executable(filename):
         with open(filename) as f:
             is_script = (f.read(2) == '#!')
@@ -150,7 +130,7 @@ def postprocess_multiline_shebang(build_store, filename):
     Try to rewrite the shebang of scripts. This function deals with
     detecting whether the script is a shebang, and if so, rewrite it.
     """
-    if not os.path.isfile(filename) or not is_executable(filename):
+    if not os.path.isfile(filename) or os.path.islink(filename) or not is_executable(filename):
         return
 
     with open(filename) as f:
@@ -170,17 +150,225 @@ def postprocess_multiline_shebang(build_store, filename):
         if mod_scriptlines != scriptlines:
             with open(filename, 'w') as f:
                 f.write(''.join(mod_scriptlines))
-        
 
-def postprocess_write_protect(filename):
+#
+# Relocatability
+#
+def postprocess_relative_symlinks(logger, artifact_dir, filename):
     """
-    Write protect files. Leave directories alone because the inability
-    to rm -rf is very annoying.
+    Turns absolute symlinks that points inside the artifact_dir into relative
+    symlinks, and gives an error on symlinks that point out of the artifact
     """
-    if not os.path.isfile(filename):
+    if os.path.islink(filename):
+        target = os.readlink(filename)
+        if os.path.isabs(target):
+            if not filename.startswith(artifact_dir):
+                msg = 'Absolute symlink %s points to %s outside of %s' % (filename, target, artifact_dir)
+                logger.error(msg)
+                raise ValueError(msg)
+            else:
+                new_target = os.path.relpath(target, os.path.dirname(filename))
+                logger.debug('Rewriting symlink "%s" from "%s" to "%s"' % (filename, target, new_target))
+                os.unlink(filename)
+                os.symlink(new_target, filename)
+
+def postprocess_rpath(logger, artifact_root_dir, env, filename):
+    if os.path.islink(filename) or not os.path.isfile(filename) or not is_executable(filename):
         return
-    write_protect(filename)
+    if 'linux' in sys.platform:
+        postprocess_rpath_linux(logger, env, filename)
+    if 'darwin' in sys.platform:
+        postprocess_rpath_darwin(logger, artifact_root_dir, env, filename)
 
+def _check_call(logger, cmd):
+    """
+    Like subprocess.check_call but additionally captures stdout/stderr, and returns stdout.
+    """
+    p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    out, err = p.communicate()
+    if p.wait() != 0:
+        logger.error('%r failed: %d' % (cmd, p.wait()))
+        raise Exception(
+            'Command %r failed with code %d and stderr:\n%s' % (cmd, p.wait(), err))
+    return out
+
+def postprocess_rpath_darwin(logger, artifact_root_dir, env, filename):
+    """
+    Convert absolute Mach-O dyld links to libraries in the build store to relative links
+    """
+
+    print filename
+    print artifact_root_dir
+
+    out = _check_call(logger, ['otool', '-l', filename])
+
+    def emit_load_cmds(cmd_list):
+        """
+        Given a list of Mach-O load commands, emit all dynamic libraries to be loaded
+        """
+        for i, line in enumerate(cmd_list):
+            if 'cmd LC_LOAD_DYLIB' in line:
+                yield cmd_list[i+2]
+
+    def emit_absolute_libs(otool_l_output):
+        """
+        Given the raw output of otool -l, emit the names of any dynamic libraries that
+        are referred to the absolute location of the artifact_root_dir
+        """
+        cmd_list = out.splitlines()[1:]
+        for load_cmd in emit_load_cmds(cmd_list):
+            lib_path = load_cmd.split()[1]
+            if artifact_root_dir in lib_path:
+                yield lib_path
+
+    if out:
+        # check for the presence of absolute references to the artifact_root_dir
+        d = os.path.dirname(os.path.realpath(filename))
+        for abs_lib_path in emit_absolute_libs(out):
+            rel_lib_path = '@loader_path/' + os.path.relpath(abs_lib_path, d)
+            logger.debug('Rewriting absolute library path on "%s" from "%s" to "%s"' %
+                         (filename, abs_lib_path, rel_lib_path))
+            _check_call(logger, ['install_name_tool', '-change', abs_lib_path, rel_lib_path, filename])
+
+def postprocess_rpath_linux(logger, env, filename):
+    # Read first 4 bytes to check for ELF magic
+    with open(filename) as f:
+        if f.read(4) != '\x7fELF':
+            # Not an ELF file
+            return
+
+    if 'PATCHELF' not in env:
+        raise Exception('PATCHELF not set (Linux relocatable packages depend on patchelf)')
+    patchelf = env['PATCHELF']
+
+    # OK, we have an ELF, patch it. We first shrink the RPATH to what is actually used.
+    _check_call(logger, [patchelf, '--shrink-rpath', filename])
+
+    # Then grab the RPATH, make each path relative to ${ORIGIN}, and set again.
+    out = _check_call(logger, [patchelf, '--print-rpath', filename]).strip()
+    if out:
+        # non-empty RPATH, patch it
+        abs_rpaths_str = out.strip()
+        abs_rpaths = abs_rpaths_str.split(':')
+        d = os.path.dirname(os.path.realpath(filename))
+        rel_rpaths = ['${ORIGIN}/' + os.path.relpath(abs_rpath, d) for abs_rpath in abs_rpaths]
+        rel_rpaths_str = ':'.join(rel_rpaths)
+        logger.debug('Rewriting RPATH on "%s" from "%s" to "%s"' % (filename, abs_rpaths_str, rel_rpaths_str))
+        _check_call(logger, [patchelf, '--set-rpath', rel_rpaths_str, filename])
+
+
+PKG_CONFIG_FILES_RE = re.compile(r'.*/lib/pkgconfig/.*\.pc$')
+def postprocess_remove_pkgconfig(logger, filename):
+    """
+    Delete pkg-config .pc-files
+
+    These include the absolute path by default. Packages may be able
+    to build without pkg-config information, so one (suboptimal)
+    possibility is to delete them.
+    """
+    if PKG_CONFIG_FILES_RE.match(os.path.realpath(filename)):
+        logger.info('Removing %s' % filename)
+        silent_unlink(filename)
+
+def postprocess_relative_pkgconfig(logger, artifact_dir, filename):
+    """
+    Rewrite pkg-config .pc-files without absolute paths.
+
+    Replaces the ``artifact_dir`` with ``${FOO_DIR}`` (replace ``FOO``
+    with package name). The hashstack pkg-config includes a wrapper
+    script that then passes ``--define-variable=FOO_DIR=artifact_dir``
+    to the pkg-config implementation.
+    """
+    if not PKG_CONFIG_FILES_RE.match(os.path.realpath(filename)):
+        return
+    if os.path.islink(filename):
+        # Link to another pc file, e.g. libpng.pc -> libpng16.pc
+        return
+    # we don't have access to the spec of the package that we are rewriting :-(
+    # ugly workaround: guess package name from the artifact dir
+    name = os.path.basename(os.path.dirname(artifact_dir))
+    package_dir = '${' + name.upper() + '_DIR}'
+    logger.info('Rewriting %s using %s', filename, package_dir)
+    with open(filename, 'r') as f:
+        pc = f.read()
+    pc = pc.replace(artifact_dir, package_dir)
+    with open(filename, 'w') as f:
+        f.write(pc)
+
+def postprocess_sh_script(logger, patterns, artifact_dir, filename):
+    """
+    `patterns` should only match files that should be modified.
+    Assuming the script is a bash/sh script, we modify it
+    """
+    if not os.path.isfile(filename) or os.path.islink(filename):
+        return
+    filename = os.path.realpath(filename)
+    s = filename[len(artifact_dir):]
+    for pattern in patterns:
+        if re.match(pattern, s):
+            break
+    else:
+        return
+
+    # Number of .. to get from script-dir to artifact_dir
+    up = os.path.relpath(artifact_dir, os.path.dirname(filename))
+
+    # Pattern matches, let's modify the file:
+    # a) Insert a small script to set HASHDIST_ARTIFACT to the artifact containing the script
+    # b) Replace occurences of the artifact dir with ${HASHDIST_ARTIFACT}
+    logger.info('Patching %s to compute artifact path dynamically' % filename)
+    script = ['# Compute HASHDIST_ARTIFACT\n'] + pack_sh_script(dedent("""\
+        o=`pwd`
+        p="$0"
+        while test -L "$p"; do  # while it is a link
+            cd `dirname "$p"`
+            b=`basename "$p"`
+            p=`readlink "$p"`
+        done
+        cd `dirname "$p"`/%(up)s
+        HASHDIST_ARTIFACT=`pwd -P`
+        cd "$o"
+    """ % dict(up=up))).splitlines(True)
+    with open(filename) as f:
+        lines = f.readlines(True)  # keepends=True
+    if not lines:
+        # empty
+        return
+    i = 1 if lines[0].startswith('#!') else 0
+    lines = lines[:i] + script + [line.replace(artifact_dir, '${HASHDIST_ARTIFACT}') for line in lines[i:]]
+    with open(filename, 'w') as f:
+        f.write(''.join(lines))
+
+
+def check_relocatable(logger, ignore_patterns, artifact_dir, filename):
+    """
+    Checks whether `filename` contains the string `artifact_dir`, in which case it is not
+    relocatable.
+
+    For now we simply load the entire file into memory.
+    """
+    if not filename.startswith(artifact_dir):
+        raise ValueError('filename must be prefixed with artifact_dir')
+    s = filename[len(artifact_dir):]
+    for pattern in ignore_patterns:
+        if re.match(pattern, s):
+            return
+
+    artifact_dir_b = artifact_dir.encode(sys.getfilesystemencoding())
+    baddies = []
+    is_link = os.path.islink(filename)
+    if not is_link and os.path.isfile(filename):
+        with open(filename) as f:
+            data = f.read()
+        if artifact_dir_b in data:
+            logger.error('File contains "%s" and can not be relocated: %s' % (artifact_dir_b, filename))
+            baddies.append(filename)
+    elif is_link:
+        if artifact_dir_b in os.readlink(filename):
+            logger.error('Symlink contains "%s" and can not be relocated: %s' % (artifact_dir_b, filename))
+            baddies.append(filename)
+    if baddies:
+        raise Exception('Files not relocatable:\n%s' % ('\n'.join('  ' + x for x in baddies)))
 
 #
 # Shebang
@@ -204,7 +392,7 @@ def make_relative_multiline_shebang(build_store, filename, scriptlines):
     ----------
 
     build_store : BuildStore
-        Used to identify shebangs that reference paths within Hashdist artifacts
+        Used to identify shebangs that reference paths within HashDist artifacts
 
     scriptlines : list of str
         List of lines in the script; each line includes terminating newline
@@ -242,43 +430,69 @@ def make_relative_multiline_shebang(build_store, filename, scriptlines):
 # relative to the script location.
 
 _launcher_script = dedent("""\
-    r="%(relpath)s" # relative path to bin-directory if profile lookup fails
     i="%(interpreter)s" # interpreter base-name
     %(arg_assign)s # may be 'arg=...' if there is an argument
-    o=`pwd`
 
-    # Loop to follow chain of links by cd-ing to their
-    # directories and calling readlink. $p is current link.
-    # After exiting loop, one is in the directory of the real script.
+    # If this script is called during "hit build" (i.e. HDIST_IN_BUILD=yes),
+    # then we simply call the $i (interpreter name) on this script (no lookup
+    # happens). This assumes that $i is in the path. Typically you put "python"
+    # into the $PATH while building Python packages and then assign $i=python.
+
+    if [ "$HDIST_IN_BUILD" = "yes" ] ; then exec "$i" "$0"%(arg_expr)s"$@"; fi
+
+    # If this script is called by the user (i.e. HDIST_IN_BUILD!=yes), then the
+    # script must be in a profile. As such, all we need to do is to loop to
+    # follow the chain of links by cd-ing to their directories and calling
+    # readlink, until we cd into the directory with artifact.json. From there
+    # we call bin/$i (i.e. typically bin/python) on this script. If
+    # artifact.json cannot be found, we exit with an error.
+
+    o=`pwd`
+    # $p is the current link:
     p="$0"
     while true; do
-        # Must test for whether $p is a link, and we should continue looping
-        # or not, before we change directory.
+        # This loop tests whether $p is a link and if so, it continues
+        # following the symlinks (this happens e.g. when the user symlinks
+        # "ipython" from some profile into their ~/bin directory which is on
+        # the $PATH). For each step, it tries to determine whether it is in the
+        # profile and if so, executes the bin/$i from there, and if not,
+        # continue looping.
+        # If $p is not a symlink (and not in a profile), then it fails with an
+        # error. This outer loop must always terminate, because eventually $p
+        # will not be a symlink, and it will either be in a profile (success)
+        # or not (failure).
         test -L "$p"
         il=$? # is_link
         cd `dirname "$p"`
         pdir=`pwd -P`
         d="$pdir"
 
-        # Loop to cd upwards towards root searching for "profile.json" file.
+        # In this inner loop we cd upwards towards root searching for
+        # "artifact.json" file. If we find it, we execute bin/$i from there. If
+        # we don't find it, we exit the loop without an error.
         while [ "$d" != / ]; do
-          [ -e profile.json ]&&cd "$o"&&exec "$d/bin/$i" "$0"%(arg_expr)s"$@"
-          cd ..
-          d=`pwd -P`
+
+            if [ -e "$d/artifact.json" ]; then
+                if [ ! -e "$d/bin/$i" ]; then
+                    echo "Unable to locate needed $i in $p/bin"
+                    echo "HashDist profile $d has likely been corrupted, please try rebuilding."
+                    exit 127
+                fi
+                cd "$o" && exec "$d/bin/$i" "$0"%(arg_expr)s"$@"
+            fi
+            cd ..
+            d=`pwd -P`
         done
 
-        # No is-profile found; 
         cd "$pdir"
-        if [ "$il" -ne 0 ];then break;fi
-        p=`readlink $p`
+        if [ "$il" -ne 0 ]; then
+            # $p is not a symlink and not in a profile (this simply means that
+            # no profile was found), so we terminate the loop with an error.
+            echo "No profile found."
+            exit 127
+        fi
+        p=`readlink $p`  # TODO should this not be readlink of `basename $p`?
     done
-    # No profile found, execute relative
-    cd "$r"
-    p=`pwd -P`
-
-    cd "$o"
-    exec "$p/$i" "$0"%(arg_expr)s"$@"
-    exit 127
 """)
 
 def _get_launcher(script_filename, shebang):
@@ -380,5 +594,3 @@ def add_modelines(scriptlines, language):
     else:
         vi_modeline = []
     return shebang + emacs_modeline + body + vi_modeline
-
-    
